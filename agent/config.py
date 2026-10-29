@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""
+Configuration and utilities for the Competitor Analysis Agent
+"""
+
+import os
+import subprocess
+import logging
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Model configuration
+# Updated Configuration for better/cheaper performance
+# TEMPORARY: Using free model for testing
+COORDINATOR_MODEL ="nvidia/nemotron-3.5-super-vl:free"   #"moonshotai/kimi-k2.6"  # Higher reasoning, 75% cheaper
+AGENT_MODEL = "nvidia/nemotron-3.5-super-vl:free"     # Faster extraction, 80% cheaper
+
+# Or for context-heavy needs:
+# COORDINATOR_MODEL = "google/gemini-3.1-pro"
+
+# LLM Provider Selection
+# Supported providers: "openrouter" (default), "bharatcode"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openrouter").lower()
+
+# BharatCode Configuration (used when LLM_PROVIDER=bharatcode)
+BHARATCODE_API_KEY = os.getenv("BHARATCODE_API_KEY")
+BHARATCODE_MODEL = os.getenv("BHARATCODE_MODEL", "qwen-3.8-27b")
+BHARATCODE_BASE_URL = os.getenv("BHARATCODE_BASE_URL", "https://bharatcode.ai/api/model/v1")
+
+# Validate BharatCode configuration
+if LLM_PROVIDER == "bharatcode" and not BHARATCODE_API_KEY:
+    raise ValueError(
+        "BharatCode provider selected but BHARATCODE_API_KEY is not set. "
+        "Please set BHARATCODE_API_KEY in your environment or .env file, "
+        "or set LLM_PROVIDER=openrouter to use the default provider."
+    )
+
+if LLM_PROVIDER not in ["openrouter", "bharatcode"]:
+    raise ValueError(
+        f"Unsupported LLM_PROVIDER: {LLM_PROVIDER}. "
+        "Supported providers: 'openrouter' (default), 'bharatcode'."
+    )
+
+# Optional: Crawl4AI (free, open-source alternative/supplement to Firecrawl)
+try:
+    from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+    CRAWL4AI_AVAILABLE = True
+except ImportError:
+    CRAWL4AI_AVAILABLE = False
+    print("[!] crawl4ai not installed. Using Firecrawl only. Run: pip install crawl4ai && crawl4ai-setup")
+
+# Optional: Agent Reach (enhanced platform access)
+try:
+    def check_agent_reach():
+        """Check if Agent Reach is available"""
+        try:
+            # First check if agent-reach command exists
+            result = subprocess.run(['where', 'agent-reach'], 
+                                  capture_output=True, text=True, 
+                                  timeout=5, encoding='utf-8', errors='replace')
+            if result.returncode != 0:
+                return False
+            
+            # If command exists, try a quick version check instead of doctor
+            result = subprocess.run(['agent-reach', '--version'], 
+                                  capture_output=True, text=True, 
+                                  timeout=5, encoding='utf-8', errors='replace')
+            return result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+    
+    def agent_reach_search(platform: str, query: str) -> str:
+        """Use Agent Reach for platform-specific search"""
+        if not check_agent_reach():
+            return f"Agent Reach not available for {platform} search"
+        
+        try:
+            if platform.lower() == 'twitter':
+                result = subprocess.run(['twitter', 'search', query, '-n', '10'], 
+                                  capture_output=True, text=True, timeout=30,
+                                  encoding='utf-8', errors='replace')
+            elif platform.lower() == 'reddit':
+                result = subprocess.run(['rdt', 'search', query], 
+                                  capture_output=True, text=True, timeout=30,
+                                  encoding='utf-8', errors='replace')
+            elif platform.lower() == 'youtube':
+                result = subprocess.run(['yt-dlp', '--dump-json', f'ytsearch10:{query}'], 
+                                  capture_output=True, text=True, timeout=30,
+                                  encoding='utf-8', errors='replace')
+            elif platform.lower() == 'github':
+                result = subprocess.run(['gh', 'search', 'repos', query, '--limit', '10'], 
+                                  capture_output=True, text=True, timeout=30,
+                                  encoding='utf-8', errors='replace')
+            else:
+                return f"Unsupported platform: {platform}"
+            
+            if result.returncode == 0:
+                return result.stdout
+            else:
+                return f"Agent Reach {platform} search failed: {result.stderr}"
+        except subprocess.TimeoutExpired:
+            return f"Agent Reach {platform} search timed out"
+        except Exception as e:
+            return f"Agent Reach {platform} error: {e}"
+    
+    AGENT_REACH_AVAILABLE = check_agent_reach()
+    if AGENT_REACH_AVAILABLE:
+        print("[+] Agent Reach available - enhanced platform access enabled")
+    else:
+        print("[!] Agent Reach not available. Install: https://raw.githubusercontent.com/Panniantong/agent-reach/main/docs/install.md")
+        
+except ImportError:
+    AGENT_REACH_AVAILABLE = False
+    print("[!] Agent Reach integration disabled")
+
+# Optional: YouTube Data API (free — 10,000 units/day)
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+try:
+    from googleapiclient.discovery import build as youtube_build
+    YOUTUBE_AVAILABLE = bool(YOUTUBE_API_KEY)
+except ImportError:
+    YOUTUBE_AVAILABLE = False
+    print("[!] google-api-python-client not installed. YouTube analysis will use search fallback.")
+
+# Optional: Google Maps Scraper (via Docker)
+# Set ENABLE_GOOGLE_MAPS_SCRAPER=true in .env to enable
+GOOGLE_MAPS_SCRAPER_AVAILABLE = os.getenv("ENABLE_GOOGLE_MAPS_SCRAPER", "false").lower() == "true"
+
+if GOOGLE_MAPS_SCRAPER_AVAILABLE:
+    try:
+        def check_docker():
+            """Check if Docker is available and running"""
+            try:
+                result = subprocess.run(['docker', '--version'], 
+                                      capture_output=True, text=True, 
+                                      timeout=5, encoding='utf-8', errors='replace')
+                return result.returncode == 0
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                return False
+        
+        if check_docker():
+            print("[+] Google Maps Scraper integration enabled (Docker available)")
+        else:
+            print("[-] Google Maps Scraper requested but Docker not available. Disabling.")
+            GOOGLE_MAPS_SCRAPER_AVAILABLE = False
+    except Exception:
+        print("[-] Docker check failed. Google Maps Scraper disabled.")
+        GOOGLE_MAPS_SCRAPER_AVAILABLE = False
+else:
+    print("[!] Google Maps Scraper disabled. Set ENABLE_GOOGLE_MAPS_SCRAPER=true in .env to enable.")
+
+# Advanced Features Configuration
+# Toggle advanced report sections (Methodology, Personas, Risk, etc.)
+ENABLE_ADVANCED_SECTIONS = os.getenv("ENABLE_ADVANCED_SECTIONS", "true").lower() == "true"
+
+# Toggle ASCII/text-based visual charts in reports
+ENABLE_VISUAL_CHARTS = os.getenv("ENABLE_VISUAL_CHARTS", "true").lower() == "true"
+
+# Data verification mode - strict mode rejects unverified data
+STRICT_VERIFICATION = os.getenv("STRICT_VERIFICATION", "true").lower() == "true"

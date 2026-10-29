@@ -1,0 +1,1539 @@
+#!/usr/bin/env python3
+"""
+Competitor Analysis Agent - Modular Version
+Fixes: Social media scraping, report quality, Crawl4AI integration
+
+Usage:
+  python main_modular.py --company "Stripe" --domain "payment processing" --initial_competitors "Braintree, PayPal"
+"""
+
+import argparse
+import logging
+import re
+import time
+from typing import Optional
+from agent.config import (
+    COORDINATOR_MODEL, AGENT_MODEL, CRAWL4AI_AVAILABLE,
+    AGENT_REACH_AVAILABLE, YOUTUBE_AVAILABLE, ENABLE_ADVANCED_SECTIONS, GOOGLE_MAPS_SCRAPER_AVAILABLE
+)
+from agent.models import CompetitorProfile
+from agent.agents.competitor_discovery_agent import competitor_discovery_agent
+from agent.agents.product_analysis_agent import product_analysis_agent
+from agent.agents.pricing_business_agent import pricing_business_agent
+from agent.agents.seo_content_agent import seo_content_agent
+from agent.agents.social_media_agent import social_media_agent
+from agent.agents.news_intelligence_agent import news_intelligence_agent
+from agent.agents.customer_feedback_agent import customer_feedback_agent
+from agent.agents.swot_synthesis_agent import swot_synthesis_agent
+from agent.agents.advanced_sections_agent import advanced_sections_agent
+from agent.tools import get_youtube_channel_stats, scrape_google_maps
+from agent.report_generator import synthesize_final_report, save_report, clean_cutoff
+from agent.business_type import classify_business_type, get_search_template, get_section_inclusions, get_terminology
+
+try:
+    from agent.tools import TavilyTools, SerperTools
+
+    SEARCH_TOOLS_AVAILABLE = True
+except ImportError:
+    TavilyTools = None  # type: ignore[misc, assignment]
+    SerperTools = None  # type: ignore[misc, assignment]
+    SEARCH_TOOLS_AVAILABLE = False
+
+# Max chars passed into downstream agents (sentence-aware); full step_results stay intact for the report.
+# Increased limits to prevent data loss from excessive truncation
+SWOT_CONTEXT_SECTION_MAX = 20000
+ADVANCED_CONTEXT_SECTION_MAX = 20000
+
+# Per-section overrides for SWOT context - all increased significantly
+SWOT_DISCOVERY_MAX = 15000
+SWOT_PRODUCT_MAX   = 15000
+SWOT_PRICING_MAX   = 15000
+SWOT_FEEDBACK_MAX  = 15000
+SWOT_NEWS_MAX      = 15000
+SWOT_SOCIAL_MAX    = 15000
+
+# Per-section overrides for advanced context (Sections 12–19 need more context)
+ADVANCED_DISCOVERY_MAX = 20000
+ADVANCED_FEEDBACK_MAX   = 20000
+
+# Substrings (lowercase) matched against cleaned LLM headers → keys used by report_generator.py
+SECTION_KEY_MAP = {
+    "customer personas": "personas",
+    "customer persona": "personas",
+    "risk assessment": "risk",
+    "actionable recommendations": "recommendations",
+    "financial benchmarks": "financial",
+    "digital ads": "digital_ads",
+    "ugc": "ugc",
+    "hashtag": "ugc",
+    "accessibility": "accessibility",
+    "seasonal": "seasonal",
+    "next steps": "action_plan",
+    "action plan": "action_plan",
+}
+
+
+def clean_advanced_section_header(header: str) -> str:
+    """Strip markdown hashes, then leading digits, dots, and whitespace; lowercase."""
+    s = re.sub(r"^#+\s*", "", header.strip())
+    s = s.lstrip("0123456789. \t")
+    return s.lower()
+
+
+def map_advanced_header_to_canonical_key(header: str) -> str:
+    """
+    Map a section header to a short canonical key using SECTION_KEY_MAP substring rules.
+    Unknown sections fall back to a snake_case slug of the cleaned header.
+    """
+    cleaned = clean_advanced_section_header(header)
+    for phrase, canonical in SECTION_KEY_MAP.items():
+        if phrase in cleaned:
+            return canonical
+    return re.sub(r"[^a-z0-9]+", "_", cleaned).strip("_") or "misc"
+
+
+# Aggregator domains/names to reject in titles
+AGGREGATOR_REJECT_PATTERNS = [
+    "reddit", "tripadvisor", "yelp", "yelp.com", "quora",
+    "2foodtrippers", "eater", "timeout", "thrillist",
+    "infatuation", "lonelyplanet", "booking.com",
+    "traveling outside the box", "askberliners", "pourover",
+]
+
+# Superlative / article-pattern phrases that signal a non-business title
+TITLE_REJECT_PATTERNS = [
+    r"^best\s", r"^top\s", r"^great\s", r"^\d+\s",
+    r"^guide to\s", r"^where to\s",
+    r"\s:\s*r/", r"\sreddit", r"\s–\s+\w+\s+\w+\s+\w+",  # : r/, reddit, " – word word word"
+    r"\bguide\b", r"\bblog\b", r"\barticle\b", r"\blist\b",  # guide/blog/article/list keywords
+    r"coffee shop with an", r"high-standard",  # generic descriptions
+]
+
+
+def validate_business_name(name: str, location: str) -> bool:
+    """
+    Follow-up search for "{name} {location} address opening hours".
+    Returns True only if the top result contains a street address pattern
+    or the words 'hours'/'open'/'closed'.
+    On exception: pass-through (default True) so network errors don't block all competitors.
+    """
+    if not SEARCH_TOOLS_AVAILABLE or TavilyTools is None:
+        return True
+
+    from agno.agent import Agent
+    from agent.models import agent_model
+
+    followup_query = f"{name} {location} address opening hours"
+    try:
+        agent = Agent(
+            tools=[TavilyTools()],
+            model=agent_model(),
+            instructions=["Search and return only the top result snippet."],
+        )
+        result = agent.run(f"Search for: {followup_query}")
+        snippet = str(getattr(result, "content", "") or result).lower()
+
+        # Street address pattern: digits followed by a street word
+        address_pattern = re.search(r"\d+\s+\w+\s+(street|st\.|avenue|ave\.|road|rd\.|boulevard|blvd\.|drive|dr\.|lane|ln\.|way|place|pl\.|court)", snippet)
+        if address_pattern:
+            return True
+
+        # Hours-related keywords
+        if any(kw in snippet for kw in ["hours", "open", "closed"]):
+            return True
+
+        return False
+    except Exception:
+        return True  # pass-through on error
+
+
+def _hit_to_competitor_row(title: str, company: str, location: str = "") -> dict | None:
+    name = (title or "").strip()
+    name_lower = name.lower()
+
+    if not name or name.casefold() == company.strip().casefold():
+        return None
+
+    # Reject: title too long (real business names are short)
+    if len(name) > 60:
+        print(f"  [!] Rejected (too long): {name[:60]}")
+        return None
+
+    # Reject: truncated names (ending with "..." or "…")
+    if name.endswith("...") or name.endswith("…"):
+        print(f"  [!] Rejected (truncated): {name[:60]}")
+        return None
+
+    # Reject: contains " - " followed by an aggregator name
+    if " - " in name:
+        after_dash = name.split(" - ", 1)[1].lower()
+        for agg in AGGREGATOR_REJECT_PATTERNS:
+            if agg.lower() in after_dash:
+                print(f"  [!] Rejected (aggregator): {name[:60]}")
+                return None
+
+    # Reject: matches any superlative / article pattern
+    for pattern in TITLE_REJECT_PATTERNS:
+        if re.search(pattern, name_lower):
+            print(f"  [!] Rejected (pattern match): {name[:60]}")
+            return None
+
+    # Validate: follow-up search to verify it's a real business
+    if location:
+        print(f"  [?] Validating business: {name}")
+        if not validate_business_name(name, location):
+            print(f"  [!] Rejected (validation failed): {name[:60]}")
+            return None
+        print(f"  [✓] Business validated: {name}")
+
+    return {
+        "name": name,
+        "address": "",
+        "rating": "",
+        "review_count": "",
+    }
+
+
+def _parse_scraper_results(scraper_data: dict) -> list[dict]:
+    """Parse Google Maps Scraper JSON output to extract competitor data."""
+    competitors = []
+    
+    if not scraper_data.get("success"):
+        return competitors
+    
+    data = scraper_data.get("data", [])
+    if not data:
+        return competitors
+    
+    # Handle both single dict and list of dicts
+    if isinstance(data, dict):
+        data = [data]
+    
+    for item in data:
+        try:
+            competitor = {
+                "name": item.get("title", item.get("name", "")),
+                "address": item.get("address", item.get("location", "")),
+                "rating": str(item.get("review_rating", item.get("rating", ""))),   # note review_rating
+                "review_count": str(item.get("review_count", item.get("reviews", item.get("reviewCount", "")))),  # note review_count
+                "phone": item.get("phone", ""),
+                "website": item.get("web_site", item.get("website", "")),           # web_site is the correct key
+                "price_level": item.get("price_range", item.get("priceLevel", "")),
+                "latitude": item.get("latitude", ""),
+                "longitude": item.get("longtitude", item.get("longitude", "")),     # note "longtitude" typo in scraper
+                "source": "Google Maps Scraper"
+            }
+            if competitor["name"]:  # Only add if name exists
+                competitors.append(competitor)
+        except Exception as e:
+            print(f"  [!] Error parsing scraper item: {e}")
+    
+    return competitors
+
+
+def _extract_titles_from_result(result) -> list[str]:
+    """Extract title strings from whatever agno search tools actually return.
+
+    agno TavilyTools/SerperTools return a plain string (JSON-formatted or
+    prose). We handle three cases:
+      1. String  → regex-scan for "title": "..." JSON fields
+      2. List    → iterate items; each item may be a dict or have a .title attr
+      3. Object  → try .results / .organic then fall through to str()
+    """
+    titles: list[str] = []
+
+    if isinstance(result, str):
+        titles = re.findall(r'"title":\s*"([^"]+)"', result)
+
+    elif isinstance(result, list):
+        for item in result:
+            if isinstance(item, dict):
+                t = item.get("title") or item.get("name") or ""
+            else:
+                t = getattr(item, "title", "") or getattr(item, "name", "") or ""
+            if t:
+                titles.append(str(t))
+
+    else:
+        # Object with sub-collections (legacy path — kept as safe fallback)
+        sub = getattr(result, "results", None) or getattr(result, "organic", None)
+        if sub:
+            return _extract_titles_from_result(sub)
+        # Last resort: stringify and regex-scan
+        titles = re.findall(r'"title":\s*"([^"]+)"', str(result))
+
+    return titles
+
+
+def _collect_competitors_from_search_query(query: str, company: str, location: str = "") -> list[dict]:
+    """Run Tavily then Serper for one query; return competitor dict rows from result titles."""
+    rows: list[dict] = []
+    if not SEARCH_TOOLS_AVAILABLE or TavilyTools is None or SerperTools is None:
+        return rows
+
+    from agno.agent import Agent
+    from agent.models import agent_model
+
+    # ── Tavily ────────────────────────────────────────────────────────────────
+    try:
+        tavily_agent = Agent(
+            tools=[TavilyTools()],
+            model=agent_model(),
+            instructions=[f"Search for: {query}. Return only business names, one per line."],
+        )
+        tavily_result = tavily_agent.run(f"Search for: {query}")
+        titles = _extract_titles_from_result(tavily_result)[:5]
+        for title in titles:
+            row = _hit_to_competitor_row(title, company, location)
+            if row:
+                rows.append(row)
+        if len(rows) < 2:
+            rows.clear()
+        elif rows:
+            print(f"     Tavily extracted {len(rows)} names for: {query}")
+            return rows
+    except Exception as e:
+        print(f"     [!] Tavily failed ({e}); trying Serper...")
+
+    # ── Serper (fallback) ─────────────────────────────────────────────────────
+    try:
+        serper_agent = Agent(
+            tools=[SerperTools()],
+            model=agent_model(),
+            instructions=[f"Search for: {query}. Return only business names, one per line."],
+        )
+        serper_result = serper_agent.run(f"Search for: {query}")
+        titles = _extract_titles_from_result(serper_result)[:5]
+        for title in titles:
+            row = _hit_to_competitor_row(title, company, location)
+            if row:
+                rows.append(row)
+        if len(rows) < 2:
+            rows.clear()
+        elif rows:
+            print(f"     Serper extracted {len(rows)} names for: {query}")
+    except Exception as e:
+        print(f"     [!] Serper failed ({e})")
+
+    return rows
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Local Business Competitor Analysis Agent")
+    parser.add_argument("--company", required=True, help='Target business: "Foodhallen"')
+    parser.add_argument("--domain", required=True, help='Business type: "cafe", "restaurant", "bar", "shop", "service"')
+    parser.add_argument("--location", required=True, help='Location: "Amsterdam", "New York", "London"')
+    parser.add_argument("--initial_competitors", default="Auto-discovered",
+                        help='Starting competitors: " competitor1, competitor2"')
+    parser.add_argument("--output", default=None, help="Output file path")
+    parser.add_argument("--skip-youtube", action="store_true", help="Skip YouTube API calls")
+    return parser.parse_args()
+
+
+def banner(args):
+    w = 80
+    print("\n" + "=" * w)
+    print("  LOCAL BUSINESS COMPETITOR ANALYSIS AGENT")
+    print("=" * w)
+    print(f"  Business       : {args.company}")
+    print(f"  Type           : {args.domain}")
+    print(f"  Location       : {args.location}")
+    print(f"  Competitors    : {args.initial_competitors}")
+    print(f"  Models         : {COORDINATOR_MODEL} / {AGENT_MODEL}")
+    print(f"  Crawl4AI       : {'[+] Available' if CRAWL4AI_AVAILABLE else '[-] Not installed'}")
+    print(f"  Agent Reach    : {'[+] Available' if AGENT_REACH_AVAILABLE else '[-] Not installed'}")
+    print(f"  Google Maps Scraper : {'[+] Available' if GOOGLE_MAPS_SCRAPER_AVAILABLE else '[-] Not available (Docker required)'}")
+    print(f"  Advanced Sects : {'[+] Enabled' if ENABLE_ADVANCED_SECTIONS else '[-] Disabled (set ENABLE_ADVANCED_SECTIONS=true)'}")
+    print("=" * w)
+    
+    # Local business capabilities
+    print(f"  Target: {args.domain.title()} in {args.location}")
+    print(f"  Business: {args.company}")
+    print("  Platforms: Google, Yelp, TripAdvisor, Instagram, Facebook")
+
+    if AGENT_REACH_AVAILABLE:
+        print("  Social media insights via Agent Reach")
+    else:
+        print("  [!] Enhanced platform access not enabled")
+        print("       Install: https://raw.githubusercontent.com/Panniantong/agent-reach/main/docs/install.md")
+    print("\n")
+    
+    # Pre-pull Docker image for Google Maps Scraper if enabled
+    if GOOGLE_MAPS_SCRAPER_AVAILABLE:
+        print("  [?] Pre-pulling Google Maps Scraper Docker image...")
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["docker", "pull", "gosom/google-maps-scraper"],
+                capture_output=True,
+                text=True,
+                timeout=180,  # 3 minute timeout for image pull
+                encoding='utf-8',
+                errors='replace'
+            )
+            if result.returncode == 0:
+                print("  [✓] Docker image pulled successfully")
+            else:
+                print(f"  [!] Docker pull returned non-zero: {result.stderr[:100]}")
+        except subprocess.TimeoutExpired:
+            print("  [!] Docker image pull timed out (will retry during scraping)")
+        except FileNotFoundError:
+            print("  [!] Docker not found")
+        except Exception as e:
+            print(f"  [!] Docker pull failed: {e}")
+        print()
+
+
+def run_step(
+    step_name: str,
+    agent,
+    prompt: str,
+    *,
+    company: str,
+    domain: str,
+    location: str,
+    min_content_length: int = 100,
+    business_category: str = "general"
+) -> Optional[str]:
+    """
+    Run a single analysis step with retry logic.
+
+    Args:
+        min_content_length: Minimum characters required to consider the step successful.
+                           If agent returns less, it will be retried.
+        business_category: Business type category for adaptation
+    """
+    MAX_RETRIES = 3
+    RETRY_DELAY = 5  # seconds, doubled on each retry
+
+    print(f"  Running: {step_name}...")
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            # Use safe string replacement that handles curly braces in content
+            # This avoids KeyError from .format() when content contains { or }
+            formatted_prompt = (
+                prompt.replace('{company}', company)
+                .replace('{domain}', domain)
+                .replace('{location}', location)
+            )
+
+            result = agent.run(
+                formatted_prompt,
+                session_state={"company": company, "domain": domain, "location": location, "business_category": business_category},
+            )
+            content = ""
+            if hasattr(result, "content") and result.content is not None:
+                content = result.content
+            elif isinstance(result, str):
+                content = result
+            elif result is not None:
+                content = str(result)
+            else:
+                content = ""
+
+            # Check if content is too short - retry with warning
+            content_len = len(content.strip()) if content else 0
+            if content_len < min_content_length:
+                if attempt < MAX_RETRIES:
+                    wait = RETRY_DELAY * attempt
+                    print(f"  [!] {step_name} returned only {content_len} chars (need {min_content_length})")
+                    print(f"  [!] Retrying {step_name} in {wait}s (attempt {attempt+1}/{MAX_RETRIES})...")
+                    time.sleep(wait)
+                    continue
+                else:
+                    print(f"  [!] {step_name} completed but with minimal content ({content_len} chars)")
+
+            print(f"  [+] {step_name} complete ({len(content)} chars)")
+            return content if content else None
+
+        except Exception as e:
+            last_error = e
+            logging.exception(f"{step_name} attempt {attempt}/{MAX_RETRIES} failed")
+            if attempt < MAX_RETRIES:
+                wait = RETRY_DELAY * attempt
+                print(f"  [!] Retrying {step_name} in {wait}s (attempt {attempt+1}/{MAX_RETRIES})...")
+                time.sleep(wait)
+
+    print(f"  [-] {step_name} failed after {MAX_RETRIES} attempts: {last_error}")
+    return None
+
+
+def build_business_type_instructions(category: str) -> str:
+    """
+    Build business type-specific instructions for agents based on category.
+    
+    Args:
+        category: Business category string (food, retail, service, tech, etc.)
+    
+    Returns:
+        String with category-specific instructions
+    """
+    inclusions = get_section_inclusions(category)
+    terminology = get_terminology(category)
+    
+    instructions = f"\n\nBUSINESS TYPE ADAPTATION (Category: {category.upper()}):\n"
+    
+    # Add terminology substitutions
+    instructions += f"- Use '{terminology['offering']}' instead of 'menu items' or generic terms\n"
+    instructions += f"- Use '{terminology['core_offering']}' instead of 'signature dishes'\n"
+    instructions += f"- Use '{terminology['product_line']}' instead of 'food & beverage offerings'\n"
+    
+    # Add conditional section instructions
+    if not inclusions.get("delivery_analysis", False):
+        instructions += "- DO NOT analyze delivery fees, service charges, or delivery partners\n"
+    
+    if not inclusions.get("menu_pricing", False):
+        instructions += "- DO NOT analyze menu items or food-specific pricing (use generic offerings instead)\n"
+    
+    if not inclusions.get("seating_capacity", False):
+        instructions += "- DO NOT analyze seating capacity or table arrangements\n"
+    
+    if not inclusions.get("opening_hours", False):
+        instructions += "- DO NOT analyze physical opening hours (focus on support hours or availability instead)\n"
+    
+    if not inclusions.get("parking_accessibility", False):
+        instructions += "- DO NOT analyze parking or physical accessibility\n"
+    
+    if not inclusions.get("table_service", False):
+        instructions += "- DO NOT analyze table service vs counter service\n"
+    
+    if not inclusions.get("happy_hours", False):
+        instructions += "- DO NOT analyze happy hours or promotions\n"
+    
+    if not inclusions.get("delivery_partners", False):
+        instructions += "- DO NOT analyze delivery partners (UberEats, DoorDash, etc.)\n"
+    
+    # Add search template hint
+    search_template = get_search_template(category, "{company}", "{location}")
+    instructions += f"- Recommended search pattern: '{search_template}'\n"
+    
+    return instructions
+
+
+def generate_fallback_section(section_name: str, business_category: str, company: str, location: str, domain: str) -> str:
+    """
+    Generate fallback content for advanced sections when agent fails to generate them.
+    
+    Args:
+        section_name: Name of the section (e.g., 'customer_personas', 'financial')
+        business_category: Business category from business_type.py
+        company: Target company name
+        location: Location
+        domain: Business domain/type
+    
+    Returns:
+        String with fallback content for the section
+    """
+    terminology = get_terminology(business_category)
+    
+    if section_name == 'customer_personas':
+        return f"""### Customer Personas
+
+**Note:** Customer personas generated from general {domain} industry patterns due to limited specific feedback data.
+
+**Persona 1: The Regular Customer**
+- **Demographics:** Local resident, ages 25-45, working professional
+- **Behavior:** Visits 2-3 times per week, orders consistent items, loyal to brand
+- **Motivations:** Values quality {terminology['offering']}, convenience, and atmosphere
+- **Pain Points:** Long wait times, inconsistent quality, limited seating
+- **Quote:** Based on general {domain} customer patterns
+
+**Persona 2: The Occasional Visitor**
+- **Demographics:** Tourist or visitor to {location}, ages 20-50
+- **Behavior:** Visits occasionally, tries new items, price-sensitive
+- **Motivations:** Exploring local {domain} options, convenience, recommendations
+- **Pain Points:** High prices, confusing menu, poor service
+- **Quote:** Based on general {domain} customer patterns
+
+**Persona 3: The Value Seeker**
+- **Demographics:** Budget-conscious, ages 18-35, student or early-career
+- **Behavior:** Seeks deals and promotions, price-sensitive, visits for value
+- **Motivations:** Affordability, good value for money, promotions
+- **Pain Points:** High prices, hidden fees, poor value
+- **Quote:** Based on general {domain} customer patterns
+"""
+
+    elif section_name == 'risk':
+        return f"""### Risk Assessment
+
+**Note:** Risk assessment based on general {domain} industry patterns in {location}.
+
+| Threat | Probability | Impact (1-5) | Mitigation Strategy |
+|--------|-------------|-------------|---------------------|
+| Increased competition from new {domain} businesses | Medium | 4 | Differentiate through unique {terminology['core_offering']} and customer experience |
+| Rising costs (rent, labor, ingredients) | High | 3 | Optimize operations, adjust pricing strategically |
+| Changing customer preferences | Medium | 3 | Regularly update {terminology['product_line']} based on market trends |
+| Economic downturn affecting discretionary spending | Medium | 4 | Focus on value offerings and loyalty programs |
+| Negative online reviews or reputation issues | Low | 5 | Proactive customer service and review management
+"""
+
+    elif section_name == 'recommendations':
+        return f"""### Actionable Recommendations
+
+**Note:** Recommendations based on general {domain} industry best practices.
+
+| Recommendation | Owner | Timeline | Success Metric (KPI) | Priority |
+|----------------|-------|----------|----------------------|----------|
+| Enhance {terminology['core_offering']} differentiation | Product | Short | Increased customer satisfaction scores | High |
+| Implement customer loyalty program | Marketing | Short | Repeat customer rate increase | Medium |
+| Optimize pricing strategy | Operations | Medium | Improved profit margins | High |
+| Expand digital marketing presence | Marketing | Short | Increased online engagement | Medium |
+| Improve operational efficiency | Operations | Medium | Reduced costs per transaction | High |
+"""
+
+    elif section_name == 'financial':
+        return f"""### Financial Benchmarks
+
+**Note:** Financial benchmarks based on industry averages for {domain} businesses.
+
+**Estimated Financial Performance:**
+- **Average Spend per Visitor:** Industry average for {domain} businesses in {location}
+- **Estimated Monthly Foot Traffic:** Based on location size and {domain} industry patterns
+- **Average Revenue per Month:** Calculated from above estimates
+- **Peak vs. Off-Peak Revenue Ratio:** Based on general {domain} seasonal patterns
+- **Market Share Estimate:** Based on competitor count and local market size
+
+**Cost Structure (Industry Benchmarks):**
+- **{terminology['offering'].title()} Cost:** 25-35% of revenue (Industry average for {domain})
+- **Labor Cost:** 25-30% of revenue (Industry average for {domain})
+- **Rent/Overhead:** 15-25% of revenue (Industry average for {domain})
+- **Marketing:** 3-5% of revenue (Industry average for {domain})
+- **Profit Margin:** 5-15% (Industry average for {domain})
+"""
+
+    elif section_name == 'digital_ads':
+        return f"""### Digital Ads & Paid Media
+
+**Note:** Analysis based on general {domain} industry digital marketing practices.
+
+**Current Advertising Presence:**
+- **Google Ads:** Not visible in analysis (recommend implementation)
+- **Facebook/Instagram Ads:** Not visible in analysis (recommend implementation)
+- **Other Platforms:** Not visible in analysis
+
+**Recommended Ad Strategy:**
+- **Primary Platforms:** Google Ads (local search), Instagram (visual content), Facebook (community engagement)
+- **Target Audiences:** Local residents, professionals in area, tourists visiting {location}
+- **Budget Allocation:** 40% Google Ads, 40% Instagram/Facebook, 20% retargeting
+- **Key Messaging:** Highlight {terminology['core_offering']}, quality, local authenticity
+- **Seasonal Adjustments:** Increase spend during peak {domain} season, reduce during off-peak
+"""
+
+    elif section_name == 'ugc':
+        return f"""### UGC & Hashtag Analysis
+
+**Note:** Analysis based on general {domain} industry social media practices.
+
+**Top Performing Hashtags:**
+- #{domain.replace(' ', '')}: Industry standard hashtag
+- #{location.replace(' ', '')}: Local engagement
+- #{company.replace(' ', '')}: Brand-specific hashtag
+
+**UGC Campaign Recommendations:**
+- **Campaign Idea 1:** Photo contest featuring customers with {terminology['offering']}
+- **Campaign Idea 2:** Review sharing campaign with incentives
+- **Incentive Structure:** Discounts on next visit for featured content
+- **Content Guidelines:** Focus on authentic experiences, high-quality photos
+"""
+
+    elif section_name == 'accessibility':
+        return f"""### Accessibility & Inclusivity
+
+**Note:** Accessibility features require on-site verification.
+
+**Physical Accessibility:**
+- **Wheelchair Access:** Needs verification - check official sources
+- **Parking:** Needs verification - check official sources
+- **Entrance:** Needs verification - check official sources
+- **Restrooms:** Needs verification - check official sources
+
+**Digital Accessibility:**
+- **Website:** Needs verification for mobile-friendliness and accessibility features
+- **Online Ordering:** Needs verification for accessibility compliance
+
+**Inclusivity Features:**
+- **Dietary Options:** Recommend offering diverse {terminology['offering']} options
+- **Language Support:** Recommend multi-language menus if tourist area
+- **Family Facilities:** Recommend family-friendly amenities
+- **Quiet Hours:** Consider implementing for accessibility
+
+**Recommendations:**
+- Conduct accessibility audit of physical location
+- Ensure website meets WCAG accessibility standards
+- Train staff on inclusive practices
+"""
+
+    elif section_name == 'seasonal':
+        return f"""### Seasonal Trends
+
+**Note:** Seasonal patterns based on general {domain} industry trends.
+
+**Seasonal Traffic Patterns:**
+| Month | Traffic Level | Notes |
+|-------|---------------|-------|
+| January | Low | Post-holiday slowdown |
+| February | Low-Medium | Building toward spring |
+| March | Medium | Spring awakening |
+| April | Medium-High | Spring peak |
+| May | High | Pre-summer activity |
+| June | High | Summer season start |
+| July | High | Peak summer season |
+| August | High | Peak summer season |
+| September | Medium-High | Back-to-school/business |
+| October | Medium | Fall season |
+| November | Medium | Pre-holiday buildup |
+| December | High | Holiday season |
+
+**Seasonal Strategy:**
+- **Peak Season:** Maximize staffing, optimize inventory, focus on efficiency
+- **Off-Peak Season:** Promotions, special events, maintenance, staff training
+- **Transition Periods:** Marketing campaigns, seasonal {terminology['offering']} launches
+"""
+
+    elif section_name == 'action_plan':
+        return f"""### Next Steps / Action Plan
+
+**Note:** Action plan based on general {domain} industry best practices.
+
+**Immediate Actions (0-30 days):**
+1. Audit current {terminology['offering']} offerings and pricing - Operations - Complete inventory review
+2. Set up basic social media presence - Marketing - Create profiles on key platforms
+3. Train staff on customer service standards - Operations - Improve customer satisfaction
+
+**Short-Term Actions (1-3 months):**
+1. Implement customer feedback collection system - Marketing - Gather actionable insights
+2. Optimize {terminology['core_offering']} based on feedback - Product - Enhance differentiation
+3. Launch initial digital marketing campaign - Marketing - Increase visibility
+
+**Medium-Term Actions (3-6 months):**
+1. Develop loyalty program - Marketing - Increase repeat customers
+2. Expand {terminology['product_line']} based on demand - Product - Grow revenue streams
+3. Improve operational efficiency - Operations - Reduce costs
+
+**Long-Term Actions (6-12 months):**
+1. Consider expansion or additional locations - Strategy - Grow market presence
+2. Develop strategic partnerships - Strategy - Increase reach
+3. Implement advanced analytics - Operations - Data-driven decisions
+
+**Success Tracking:**
+- Monthly review of key metrics (revenue, customer satisfaction, repeat rate)
+- Quarterly strategy adjustment based on performance
+- Annual comprehensive review and planning
+"""
+
+    else:
+        return f"*Insufficient data - {section_name} section could not be generated from available research data.*"
+
+
+def main():
+    args = parse_args()
+    banner(args)
+    
+    company = args.company
+    domain = args.domain
+    location = args.location
+    competitors_seed = args.initial_competitors
+    
+    # Classify business type
+    business_category = classify_business_type(domain)
+    print(f"  [i] Detected business type: {business_category}")
+    
+    context = f"Business: {company} | Type: {domain} | Location: {location} | Known competitors: {competitors_seed} | Category: {business_category}"
+    target_analysis_instruction = (
+        f"\n\nANALYSIS ORDER — MANDATORY:\n"
+        f"1. First, fully analyze the TARGET business: {company}\n"
+        f"   - Give {company} its own complete section with ALL fields filled\n"
+        f"   - This is the business we are advising; it must appear in every table\n"
+        f"2. Then analyze each competitor listed below\n"
+        f"3. In all comparison tables, always include {company} as the first row\n"
+    )
+    step_results = {}
+    youtube_data = {}
+    shared_data = {
+        "company": company,
+        "competitor_count": 0,
+        "competitor_list": [],
+        "canonical_reviews": {},
+        "google_reviews": {},
+        "per_competitor_prices": {},
+    }
+    
+    # Global cache for discovery scraper results
+    discovery_scraper_cache = {
+        "scraped_competitors": [],
+        "google_reviews": {}
+    }
+
+    # ── Google Maps Scraper Integration ────────────────────────────────────────
+    scraped_competitors = []
+    if GOOGLE_MAPS_SCRAPER_AVAILABLE:
+        print("  [?] Attempting Google Maps Scraper for competitor discovery...")
+        scraper_result = scrape_google_maps(domain, location, depth=1)
+        if scraper_result.get("success"):
+            scraped_competitors = _parse_scraper_results(scraper_result)
+            # Populate google_reviews directly from scraped competitors (discovery already gives rating+count)
+            for comp in scraped_competitors:
+                name = comp.get("name")
+                if name and name != company:
+                    shared_data["google_reviews"][name] = {
+                        "rating": comp.get("rating"),
+                        "count": comp.get("review_count"),
+                        "source": "google_maps_scraper"
+                    }
+            # Store in global cache for reuse in subsequent steps
+            discovery_scraper_cache["scraped_competitors"] = scraped_competitors
+            discovery_scraper_cache["google_reviews"] = shared_data["google_reviews"].copy()
+            print(f"  [✓] Loaded review data for {len(shared_data['google_reviews'])} competitors from Google Maps Scraper")
+            print(f"  [✓] Google Maps Scraper found {len(scraped_competitors)} competitors")
+            print(f"  [✓] Cached scraper data for reuse in subsequent steps")
+            for comp in scraped_competitors[:5]:  # Show first 5
+                print(f"     - {comp['name']} (Rating: {comp['rating']}, Reviews: {comp['review_count']})")
+        else:
+            print(f"  [!] Google Maps Scraper failed: {scraper_result.get('error', 'Unknown error')}")
+            print("  [!] Falling back to search-based discovery")
+    else:
+        print("  [!] Google Maps Scraper not available, using search-based discovery")
+
+    # Add scraped competitors to context for the agent
+    scraper_context = ""
+    if scraped_competitors:
+        scraper_context = "\n\nCACHED GOOGLE MAPS DISCOVERY DATA (from initial scraper call):\n"
+        for comp in scraped_competitors:
+            scraper_context += f"- {comp['name']}: Address={comp['address']}, Rating={comp['rating']}, Reviews={comp['review_count']}\n"
+        scraper_context += "\nCRITICAL: Use this cached data as the PRIMARY source. DO NOT re-scrape or search for new discovery data."
+        scraper_context += "\nThe scraper has already run and this data is cached. Use it directly."
+
+    # ── Step 1: Competitor Discovery ──────────────────────────────────────────
+    print("\nStep 1/7: Local Competitor Discovery")
+    _result = run_step(
+        "Local Competitor Discovery",
+        competitor_discovery_agent(),
+        f"{context}{scraper_context}\n\nThe target business is {company}. Include it in the comparison matrix as the baseline row with label '[TARGET]' before listing competitors."
+        f"\n\nDiscover and profile all local competitors for {company} in the {domain} category in {location}."
+        f" Use the cached discovery data provided above. Start with these known competitors: {competitors_seed}, then find more local businesses if needed.",
+        company=company,
+        domain=domain,
+        location=location,
+        business_category=business_category,
+    )
+    if _result is None:
+        step_results["discovery"] = ""
+        print("  [!] Discovery skipped -- using empty placeholder")
+    else:
+        step_results["discovery"] = _result
+
+    # ── FIX #14: Reliable competitor counting ────────────────────────────────
+    # Primary: count actual data rows in the discovery markdown table
+    discovery_lines = step_results['discovery'].split('\n')
+    table_lines = [
+        l for l in discovery_lines
+        if l.strip().startswith('|') and '---' not in l and l.strip() != '|'
+    ]
+    # Subtract 1 for the header row
+    row_count = max(0, len(table_lines) - 1)
+
+    # Parse competitor structs from those same table rows (used by downstream steps)
+    competitors = []
+    for row in table_lines[1:]:  # skip header
+        if row.strip():
+            columns = [col.strip() for col in row.split('|')]
+            if len(columns) >= 5:
+                # Parse rating as float if possible
+                rating_val = None
+                try:
+                    rating_str = columns[3] if len(columns) > 3 else ''
+                    if rating_str:
+                        rating_val = float(rating_str.split('/')[0])
+                except (ValueError, IndexError):
+                    pass
+
+                # Parse review count as int if possible
+                review_count_val = None
+                try:
+                    review_str = columns[4] if len(columns) > 4 else ''
+                    if review_str:
+                        review_count_val = int(review_str.replace(',', ''))
+                except ValueError:
+                    pass
+
+                try:
+                    # Determine which column has the actual competitor name
+                    # Skip if the first column looks like a row number (pure digits)
+                    raw_name = columns[1] if len(columns) > 1 else ''
+                    if raw_name.strip().isdigit():
+                        # Try next column - table might have # column first
+                        raw_name = columns[2] if len(columns) > 2 else ''
+                    # Also skip if name is empty or just whitespace
+                    if not raw_name.strip() or raw_name.strip() == company:
+                        continue
+
+                    profile = CompetitorProfile(
+                        name=raw_name,
+                        address=columns[2] if len(columns) > 2 else '',
+                        rating=rating_val,
+                        review_count=review_count_val
+                    )
+                    if profile.name and profile.name != company:
+                        competitors.append(profile.model_dump())
+                except Exception as e:
+                    logger.warning(f"Skipping invalid competitor row: {e}")
+
+    shared_data['competitor_list'] = competitors
+
+    # ── Limit competitors to top 4 (by review count then rating) ─────────────────────
+    if len(competitors) > 4:
+        # Sort competitors by review count (descending) then by rating (descending)
+        # Prioritize competitors with more reviews for meaningful analysis
+        competitors_sorted = sorted(
+            competitors,
+            key=lambda x: (x.get('review_count', 0) or 0, x.get('rating', 0) or 0),
+            reverse=True
+        )
+        # Take top 4
+        competitors = competitors_sorted[:4]
+        shared_data['competitor_list'] = competitors
+        print(f"  [i] Limited to top 4 competitors by review count (then rating)")
+        for comp in competitors:
+            print(f"     - {comp.get('name')} (Rating: {comp.get('rating')}, Reviews: {comp.get('review_count')})")
+    else:
+        print(f"  [i] Using all {len(competitors)} competitors (≤ 4)")
+
+    # ── Canonical review data from discovery ───────────────────────────────────
+    # Populate canonical_reviews with verified discovery data before downstream agents run
+    for comp in competitors:
+        name = comp.get('name', '')
+        rating_str = comp.get('rating', '')
+        review_str = comp.get('review_count', '')
+        if name and (rating_str or review_str):
+            shared_data['canonical_reviews'][name] = {
+                'rating': rating_str,
+                'count': review_str,
+                'source': 'discovery'
+            }
+
+    # Build canonical_data_injection for downstream prompts
+    lines = ["CANONICAL DATA — USE THESE EXACT VALUES, DO NOT SEARCH FOR NEW ONES:"]
+    for name, data in shared_data['canonical_reviews'].items():
+        lines.append(f"  - {name}: Rating {data['rating']}, Reviews {data['count']}")
+    canonical_data_injection = "\n".join(lines)
+
+    # Secondary: count from parsed list (catches rows that may have been filtered above)
+    list_count = len([c for c in competitors if c.get('name') and c['name'] != company])
+
+    # Tertiary fallback: original regex (only when both primary counts are 0)
+    regex_count = 0
+    if row_count == 0 and list_count == 0:
+        count_match = re.search(r"(\d+)\s*(?:competitors|key players)", step_results['discovery'], re.IGNORECASE)
+        if count_match:
+            regex_count = int(count_match.group(1))
+
+    # Use the most reliable signal available
+    if row_count > 0 or list_count > 0:
+        shared_data['competitor_count'] = max(row_count, list_count)
+        print(f"  [!] Competitor count via: {'table rows' if row_count >= list_count else 'list parsing'}")
+    else:
+        shared_data['competitor_count'] = regex_count
+        print(f"  [!] Competitor count via: regex fallback")
+
+    print(f"  Discovered {shared_data['competitor_count']} competitors (excluding {company})")
+
+    # Check if discovery failed or has insufficient competitors, then use deterministic fallback
+    if "Error:" in step_results["discovery"] or shared_data["competitor_count"] < 6:
+        print("  [!] Discovery failed or insufficient competitors. Running deterministic fallback...")
+
+        if not SEARCH_TOOLS_AVAILABLE:
+            print("  Search tools (Tavily/Serper) not available — cannot run web fallback.")
+            shared_data["competitor_list"] = competitors
+            shared_data["competitor_count"] = len(competitors)
+            if len(competitors) < 6:
+                print(
+                    f"  [!] Only {len(competitors)} real competitors found. Report will cover available competitors only."
+                )
+        else:
+            fallback_competitors: list[dict] = [dict(c) for c in competitors]
+            search_queries = [
+                f"{domain} near {location}",
+                f"best {domain} in {location}",
+                f"top {domain} {location}",
+            ]
+            for query in search_queries:
+                print(f" Searching: {query}")
+                try:
+                    fallback_competitors.extend(_collect_competitors_from_search_query(query, company, location))
+                except Exception:
+                    print(f"  [!] Search query failed: {query}")
+                    continue
+
+            unique_competitors: list[dict] = []
+            seen_names: set[str] = set()
+            for comp in fallback_competitors:
+                n = comp.get("name", "").strip()
+                if n and n not in seen_names:
+                    seen_names.add(n)
+                    unique_competitors.append(comp)
+
+            if len(unique_competitors) < 6:
+                second_pass_queries = [
+                    f"'{domain}' venue {location} site:google.com/maps",
+                    f"top rated {domain} {location} tripadvisor",
+                    f"{domain} {location} recommended",
+                ]
+                for query in second_pass_queries:
+                    print(f"  [!] Second-pass search: {query}")
+                    try:
+                        for row in _collect_competitors_from_search_query(query, company, location):
+                            n = row.get("name", "").strip()
+                            if n and n not in seen_names:
+                                seen_names.add(n)
+                                unique_competitors.append(row)
+                    except Exception:
+                        print(f"  [!] Second-pass query failed: {query}")
+                        continue
+
+            if len(unique_competitors) < 6:
+                print(
+                    f"  [!] Only {len(unique_competitors)} real competitors found. Report will cover available competitors only."
+                )
+
+            shared_data["competitor_list"] = unique_competitors
+            shared_data["competitor_count"] = len(unique_competitors)
+            print(f"  [!] Fallback enriched list: {shared_data['competitor_count']} competitors (real names only)")
+
+    # ── Cap competitors to 4 to prevent token overload in downstream agents ─────
+    MAX_COMPETITORS = 4
+    if len(shared_data["competitor_list"]) > MAX_COMPETITORS:
+        print(f"  [!] Capping competitor list from {len(shared_data['competitor_list'])} to {MAX_COMPETITORS}")
+        shared_data["competitor_list"] = shared_data["competitor_list"][:MAX_COMPETITORS]
+        shared_data["competitor_count"] = MAX_COMPETITORS
+
+    # Build structured competitor list for explicit injection into prompts
+    # (uses the already-capped shared_data["competitor_list"])
+    competitor_names = [comp["name"] for comp in shared_data["competitor_list"] if comp.get("name")]
+    competitor_list_str = "\n".join(f"- {name}" for name in competitor_names)
+    if competitor_names:
+        competitor_prompt_addition = (
+            f"\n\nDiscovered competitors (analyze every business listed — there are {len(competitor_names)}):\n"
+            f"{competitor_list_str}"
+        )
+    else:
+        competitor_prompt_addition = "\n\nNo structured competitor list was extracted; infer competitors from the context and search results."
+
+    # ── Step 2: Product & Service Analysis (chunked for reliability) ──────────────
+    print("\n Step 2/7: Product & Service Analysis")
+    all_product_results = []
+
+    # Process competitors in batches of 6 to prevent token limits and ensure completion
+    BATCH_SIZE = 6
+    competitor_batches = [
+        competitor_names[i:i + BATCH_SIZE]
+        for i in range(0, len(competitor_names), BATCH_SIZE)
+    ]
+
+    for batch_num, batch in enumerate(competitor_batches, 1):
+        batch_list_str = "\n".join(f"- {name}" for name in batch)
+        business_type_instructions = build_business_type_instructions(business_category)
+        batch_instruction = (
+            f"\n\nBATCH {batch_num}/{len(competitor_batches)} - Analyze these businesses:\n"
+            f"{batch_list_str}\n\n"
+            f"Focus on: offerings, specialties, unique features, ambiance, customer experience.\n"
+            f"Use ### headers for each business. Produce at least 200 words of analysis content."
+            f"{business_type_instructions}"
+        )
+
+        _result = run_step(
+            f"Product & Service Analysis (Batch {batch_num}/{len(competitor_batches)})",
+            product_analysis_agent(),
+            f"{context}{target_analysis_instruction}{canonical_data_injection}{batch_instruction}",
+            company=company,
+            domain=domain,
+            location=location,
+            business_category=business_category,
+        )
+        if _result and len(_result.strip()) >= 100:
+            all_product_results.append(_result)
+            print(f"  [+] Batch {batch_num} complete ({len(_result)} chars)")
+        else:
+            print(f"  [!] Batch {batch_num} returned empty, trying fallback...")
+            # Fallback for this batch using discovery data
+            fallback_prompt = f"""Based on this data, create product analysis for: {', '.join(batch)}
+
+{step_results.get('discovery', 'No discovery data available')}
+
+Analyze core offerings, specialties, and competitive positioning. Use markdown format."""
+            _fallback = run_step(
+                f"Product Analysis Fallback (Batch {batch_num})",
+                product_analysis_agent(),
+                fallback_prompt,
+                company=company,
+                domain=domain,
+                location=location,
+                business_category=business_category,
+            )
+            if _fallback and len(_fallback.strip()) >= 100:
+                all_product_results.append(_fallback)
+                print(f"  [+] Batch {batch_num} fallback complete ({len(_fallback)} chars)")
+
+    if all_product_results:
+        step_results["product"] = "\n\n---\n\n".join(all_product_results)
+        print(f"  [+] Product & Service Analysis complete (total: {len(step_results['product'])} chars)")
+    else:
+        step_results["product"] = ""
+        print("  [!] Product Analysis failed - using empty placeholder")
+
+    # ── Step 3: Pricing & Business Model Analysis ───────────────────────────────
+    print("\nStep 3/7: Pricing & Business Model Analysis")
+    business_type_instructions = build_business_type_instructions(business_category)
+    _result = run_step(
+        "Pricing Analysis",
+        pricing_business_agent(),
+        f"{context}{target_analysis_instruction}{canonical_data_injection}{competitor_prompt_addition}\n\n"
+        f"Analyze pricing and business model for {company} and all discovered local competitors in {location}."
+        f"{business_type_instructions}",
+        company=company,
+        domain=domain,
+        location=location,
+        min_content_length=500,
+        business_category=business_category,
+    )
+    if _result is None:
+        step_results["pricing"] = ""
+        print("  [!] Pricing Analysis skipped — using empty placeholder")
+    else:
+        step_results["pricing"] = _result
+    
+    # Extract target company's price position only from its own section (not whole pricing doc)
+    pricing_text = step_results["pricing"]
+    company_section = ""
+    section_match = re.search(
+        rf'(?:##{{1,4}})[^#\n]*{re.escape(company)}[^#\n]*\n(.*?)(?=\n##|\Z)',
+        pricing_text, re.DOTALL | re.IGNORECASE
+    )
+    if section_match:
+        company_section = section_match.group(1)
+    else:
+        company_section = pricing_text  # fallback to full text
+
+    price_position = "Data not available"
+    if '€€€' in company_section:
+        price_position = "Premium"
+    elif '€€' in company_section:
+        price_position = "Mid-range"
+    elif '€' in company_section:
+        price_position = "Budget"
+    elif 'premium' in company_section.lower():
+        price_position = "Premium"
+    elif 'mid-range' in company_section.lower() or 'mid range' in company_section.lower():
+        price_position = "Mid-range"
+    elif 'budget' in pricing_text.lower() or 'low-cost' in pricing_text.lower():
+        price_position = "Budget"
+    shared_data['price_position'] = price_position
+
+    # ── Per-competitor price extraction for positioning matrix ─────────────────
+    per_prices = {}
+    for comp in competitor_names:
+        section_pattern = rf'(?:##{{1,4}})[^#\n]*{re.escape(comp)}[^#\n]*\n(.*?)(?=\n##|\Z)'
+        section_match = re.search(section_pattern, pricing_text, re.DOTALL | re.IGNORECASE)
+        if section_match:
+            section_text = section_match.group(1)
+            if '€€€' in section_text or 'premium' in section_text.lower():
+                per_prices[comp] = 'Premium'
+            elif '€€' in section_text or 'mid' in section_text.lower():
+                per_prices[comp] = 'Mid-range'
+            elif '€' in section_text or 'budget' in section_text.lower():
+                per_prices[comp] = 'Budget'
+    shared_data['per_competitor_prices'] = per_prices
+    print(f"  Per-competitor prices extracted: {per_prices}")
+
+    # ── Step 4: Local SEO & Content ────────────────────────────────────────────────
+    print("\nStep 4/7: Local SEO & Content Strategy")
+    _result = run_step(
+        "Local SEO Analysis",
+        seo_content_agent(),
+        f"{context}{target_analysis_instruction}{canonical_data_injection}{competitor_prompt_addition}\n\n"
+        f"Analyze local SEO presence and content strategy for {company} and all competitors in {location}.",
+        company=company,
+        domain=domain,
+        location=location,
+        business_category=business_category,
+    )
+    if _result is None:
+        step_results["seo"] = ""
+        print("  [!] SEO Analysis skipped — using empty placeholder")
+    else:
+        step_results["seo"] = _result
+
+    # YouTube API supplement (if configured) — fetched BEFORE Step 5 so it can be injected into the social prompt
+    if YOUTUBE_AVAILABLE and not args.skip_youtube:
+        print("   Fetching YouTube stats via API...")
+        key_competitors = competitors_seed.split(",") + [company]
+        for comp in key_competitors[:5]:
+            comp = comp.strip()
+            if comp:
+                youtube_data[comp] = get_youtube_channel_stats(comp)
+                print(f"     YouTube data for {comp}: {youtube_data[comp].get('subscribers', 'N/A')} subscribers")
+
+    # ── Step 5: Social Media Intelligence ────────────────────────────────────────
+    print("\nStep 5/7: Social Media Intelligence")
+    yt_summary = ""
+    if youtube_data:
+        lines = ["YouTube API Data (authoritative — use these counts):"]
+        for comp, data in youtube_data.items():
+            if "error" not in data:
+                lines.append(
+                    f"  - {comp}: {data.get('subscribers','N/A')} subscribers, "
+                    f"{data.get('total_videos','N/A')} videos"
+                )
+        yt_summary = "\n".join(lines)
+    _result = run_step(
+        "Social Media Analysis",
+        social_media_agent(),
+        f"{context}{target_analysis_instruction}{canonical_data_injection}{competitor_prompt_addition}\n\n"
+        f"{yt_summary}\n\n"
+        f"Analyze social media presence for {company} and all local competitors in {location}."
+        f" Focus on local platforms and community engagement.",
+        company=company,
+        domain=domain,
+        location=location,
+        min_content_length=500,  # Require at least 500 chars - retry if too short
+        business_category=business_category,
+    )
+    if _result is None:
+        step_results["social"] = ""
+        print("  [!] Social Media Analysis skipped — using empty placeholder")
+    else:
+        step_results["social"] = _result
+    
+    # ── Step 6: Local News & Intelligence ────────────────────────────────────────
+    print("\nStep 6/7: Local News & Market Intelligence")
+    _result = run_step(
+        "Local News Analysis",
+        news_intelligence_agent(),
+        f"{context}{target_analysis_instruction}{competitor_prompt_addition}\n\n"
+        f"Find recent local news, events, and developments for {company} and competitors in {location}."
+        f" Focus on last 3-6 months of local business activity.",
+        company=company,
+        domain=domain,
+        location=location,
+        business_category=business_category,
+    )
+    if _result is None:
+        step_results["news"] = ""
+        print("  [!] News Analysis skipped — using empty placeholder")
+    else:
+        step_results["news"] = _result
+
+    # ── Step 7: Customer Feedback ─────────────────────────────────────────────
+    print("\nStep 7/7: Customer Feedback Analysis")
+    
+    # Build cached review data context
+    cached_review_context = ""
+    if discovery_scraper_cache.get("google_reviews"):
+        cached_review_context = "\n\nCACHED GOOGLE MAPS REVIEW DATA (from discovery step):\n"
+        for name, data in discovery_scraper_cache["google_reviews"].items():
+            cached_review_context += f"- {name}: Rating {data.get('rating')}, Reviews {data.get('count')}\n"
+        cached_review_context += "\nUse this cached data as the primary source. DO NOT re-scrape.\n"
+    
+    # (Review data already loaded from discovery scraper; no need for second scraper pass)
+    business_type_instructions = build_business_type_instructions(business_category)
+    _result = run_step(
+        "Customer Feedback",
+        customer_feedback_agent(),
+        f"{context}{target_analysis_instruction}{canonical_data_injection}{competitor_prompt_addition}\n\n"
+        f"{cached_review_context}\n\n"
+        f"Mine customer reviews from Google, Yelp, TripAdvisor for {company} and all local competitors in {location}."
+        f"{business_type_instructions}",
+        company=company,
+        domain=domain,
+        location=location,
+        min_content_length=500,
+        business_category=business_category,
+    )
+    if _result is None:
+        step_results["feedback"] = ""
+        print("  [!] Customer Feedback skipped — using empty placeholder")
+    else:
+        step_results["feedback"] = _result
+    
+    # Extract Google review counts and ratings from feedback output
+    import json
+    feedback_text = step_results['feedback']
+    
+    if GOOGLE_MAPS_SCRAPER_AVAILABLE:
+        json_pattern = r'\{[^{}]*"review_count"[^{}]*\}'
+        for match in re.finditer(json_pattern, feedback_text):
+            try:
+                data = json.loads(match.group())
+                if 'title' in data and 'review_count' in data:
+                    competitor_name = data['title']
+                    review_count = data['review_count']
+                    rating = data.get('rating', data.get('avgRating', None))
+                    shared_data['google_reviews'][competitor_name] = {'rating': rating, 'count': review_count}
+            except json.JSONDecodeError:
+                continue
+    
+    rating_count_pattern = r'([A-Za-z\s]+?)[\s:]+(\d+\.?\d*)[/\s]*(?:5|stars)[\s\(\)]+(\d+)\s+reviews'
+    for match in re.finditer(rating_count_pattern, feedback_text, re.IGNORECASE):
+        competitor_name = match.group(1).strip()
+        rating = float(match.group(2))
+        review_count = int(match.group(3))
+        if competitor_name not in shared_data['google_reviews']:
+            shared_data['google_reviews'][competitor_name] = {'rating': rating, 'count': review_count}
+    
+    for competitor in shared_data['competitor_list']:
+        competitor_name = competitor['name']
+        if competitor_name not in shared_data['google_reviews']:
+            rating_match = re.search(rf'{re.escape(competitor_name)}[^\n]*?(\d+\.?\d*)[/\s]*(?:5|stars)', feedback_text, re.IGNORECASE)
+            count_match_fb = re.search(rf'{re.escape(competitor_name)}[^\n]*?(\d+)\s+reviews', feedback_text, re.IGNORECASE)
+            rating = float(rating_match.group(1)) if rating_match else None
+            count = int(count_match_fb.group(1)) if count_match_fb else None
+            if rating or count:
+                shared_data['google_reviews'][competitor_name] = {'rating': rating, 'count': count}
+    
+    print(f"   Extracted Google review data for {len(shared_data['google_reviews'])} competitors")
+
+    # ── Update canonical_reviews with fresh feedback data (only for missing competitors) ──
+    # New data from feedback only fills gaps — discovery data takes precedence
+    for competitor_name, review_data in shared_data['google_reviews'].items():
+        if competitor_name not in shared_data['canonical_reviews']:
+            rating = review_data.get('rating', '')
+            count = review_data.get('count', '')
+            shared_data['canonical_reviews'][competitor_name] = {
+                'rating': rating,
+                'count': count,
+                'source': 'feedback'
+            }
+
+    # ── SWOT Synthesis ────────────────────────────────────────────────
+    print("\nBonus: SWOT Analysis & Strategic Recommendations")
+    
+    competitor_count = shared_data.get('competitor_count')
+    competitor_list = shared_data.get('competitor_list')
+
+    # Guard: only skip SWOT if competitor data is completely missing
+    # Empty strings from failed steps are tolerated — SWOT can synthesize partial data
+    if not competitor_count or not competitor_list:
+        step_results["swot"] = "Insufficient data for SWOT analysis – competitor discovery failed."
+        print("  [!] SWOT analysis skipped due to insufficient competitor data")
+    else:
+        # ── FIX #13: inject competitor names list + larger context slices ────
+        competitor_list_for_swot = '\n'.join(
+            f"- {c['name']} (rating: {c.get('rating', 'N/A')})"
+            for c in shared_data['competitor_list']
+            if c.get('name')
+        )
+
+        swot_context = f"""
+Business: {company} | Type: {domain} | Location: {location}
+Competitor Count: {shared_data['competitor_count']}
+
+Competitors to include in SWOT (you MUST generate a SWOT table for EACH one):
+{competitor_list_for_swot}
+
+Key Local Research Findings:
+- Local Competitor Discovery: {clean_cutoff(step_results['discovery'], max_chars=SWOT_DISCOVERY_MAX)}
+- Product & Service Analysis: {clean_cutoff(step_results['product'], max_chars=SWOT_PRODUCT_MAX)}
+- Pricing & Business Model: {clean_cutoff(step_results['pricing'], max_chars=SWOT_PRICING_MAX)}
+- Customer Feedback: {clean_cutoff(step_results['feedback'], max_chars=SWOT_FEEDBACK_MAX)}
+- Local News & Events: {clean_cutoff(step_results['news'], max_chars=SWOT_NEWS_MAX)}
+- Social Media: {clean_cutoff(step_results['social'], max_chars=SWOT_SOCIAL_MAX)}
+"""
+
+        # Build explicit competitor ratings list for SWOT agent
+        competitor_ratings_list = []
+        for comp in shared_data.get('competitor_list', []):
+            name = comp.get('name', '')
+            if not name:
+                continue
+            rev_data = shared_data.get('google_reviews', {}).get(name, {})
+            rating = rev_data.get('rating', 'N/A')
+            count = rev_data.get('count', 'N/A')
+            competitor_ratings_list.append(f"- {name}: Rating {rating} ({count} reviews)")
+
+        if competitor_ratings_list:
+            swot_context += "\n\n**Explicit Competitor List with Ratings:**\n" + "\n".join(competitor_ratings_list)
+
+        step_results["swot"] = run_step(
+            "SWOT Analysis",
+            swot_synthesis_agent(),
+            swot_context,
+            company=company,
+            domain=domain,
+            location=location,
+            min_content_length=300,
+            business_category=business_category,
+        )
+        if step_results["swot"] is None:
+            step_results["swot"] = ""
+
+    # ── Advanced Sections (if enabled) ────────────────────────────────────────
+    advanced_sections = {}
+    if ENABLE_ADVANCED_SECTIONS:
+        print("\nAdvanced: Strategic Analysis & Recommendations")
+        
+        # Log data availability for debugging
+        print(f"  [i] Data availability check:")
+        print(f"    - Discovery: {len(step_results.get('discovery', ''))} chars")
+        print(f"    - Product: {len(step_results.get('product', ''))} chars")
+        print(f"    - Pricing: {len(step_results.get('pricing', ''))} chars")
+        print(f"    - Feedback: {len(step_results.get('feedback', ''))} chars")
+        print(f"    - SWOT: {len(step_results.get('swot', ''))} chars")
+        
+        # Use explicit dict with .format_map() to avoid KeyError on special characters
+        advanced_context_kwargs = {
+            'company': company,
+            'domain': domain,
+            'location': location,
+            'discovery': clean_cutoff(step_results['discovery'], max_chars=ADVANCED_DISCOVERY_MAX),
+            'product': clean_cutoff(step_results['product'], max_chars=ADVANCED_CONTEXT_SECTION_MAX),
+            'pricing': clean_cutoff(step_results['pricing'], max_chars=ADVANCED_CONTEXT_SECTION_MAX),
+            'seo': clean_cutoff(step_results['seo'], max_chars=ADVANCED_CONTEXT_SECTION_MAX),
+            'social': clean_cutoff(step_results['social'], max_chars=ADVANCED_CONTEXT_SECTION_MAX),
+            'news': clean_cutoff(step_results['news'], max_chars=ADVANCED_CONTEXT_SECTION_MAX),
+            'feedback': clean_cutoff(step_results['feedback'], max_chars=ADVANCED_FEEDBACK_MAX),
+            'swot': clean_cutoff(step_results['swot'], max_chars=ADVANCED_CONTEXT_SECTION_MAX),
+        }
+        advanced_context = """CRITICAL: Generate ALL 9 sections below. Use ### headers exactly matching:
+'### 1. Customer Personas', '### 2. Risk Assessment', '### 3. Actionable Recommendations',
+'### 4. Financial Benchmarks', '### 5. Digital Ads & Paid Media', '### 6. UGC & Hashtag Analysis',
+'### 7. Accessibility & Inclusivity', '### 8. Seasonal Trends', '### 9. Next Steps / Action Plan'.
+Do NOT use #### or deeper nesting for section titles.
+
+Business: {company} | Type: {domain} | Location: {location}
+
+Complete Research Summary:
+- Discovery: {discovery}
+- Product: {product}
+- Pricing: {pricing}
+- SEO: {seo}
+- Social: {social}
+- News: {news}
+- Feedback: {feedback}
+- SWOT: {swot}"""
+
+        # Use .replace() to avoid KeyError from curly braces in content
+        advanced_context = (
+            advanced_context.replace('{company}', company)
+            .replace('{domain}', domain)
+            .replace('{location}', location)
+            .replace('{discovery}', advanced_context_kwargs['discovery'])
+            .replace('{product}', advanced_context_kwargs['product'])
+            .replace('{pricing}', advanced_context_kwargs['pricing'])
+            .replace('{seo}', advanced_context_kwargs['seo'])
+            .replace('{social}', advanced_context_kwargs['social'])
+            .replace('{news}', advanced_context_kwargs['news'])
+            .replace('{feedback}', advanced_context_kwargs['feedback'])
+            .replace('{swot}', advanced_context_kwargs['swot'])
+        )
+        advanced_result = run_step(
+            "Advanced Strategic Analysis",
+            advanced_sections_agent(),
+            advanced_context,
+            company=company,
+            domain=domain,
+            location=location,
+            min_content_length=300,
+            business_category=business_category,
+        )
+        if advanced_result is None:
+            advanced_result = ""
+            print("  [!] Advanced Analysis failed -- using empty placeholder")
+        
+        # Log result length for debugging
+        print(f"  [i] Advanced result length: {len(advanced_result)} chars")
+        
+        # Log first 500 chars of advanced result for debugging
+        print(f"  [i] Advanced result preview: {advanced_result[:500]}")
+        
+        sections = {}
+        current_section = None
+        current_content = []
+        expected_sections = [
+            "1. Customer Personas",
+            "2. Risk Assessment",
+            "3. Actionable Recommendations",
+            "4. Financial Benchmarks",
+            "5. Digital Ads & Paid Media",
+            "6. UGC & Hashtag Analysis",
+            "7. Accessibility & Inclusivity",
+            "8. Seasonal Trends",
+            "9. Next Steps / Action Plan"
+        ]
+        found_sections = []
+        
+        for line in advanced_result.split('\n'):
+            if re.match(r'^#{1,6}\s', line):
+                if current_section:
+                    canonical_key = map_advanced_header_to_canonical_key(current_section)
+                    sections[canonical_key] = '\n'.join(current_content)
+                    found_sections.append(current_section)
+                current_section = re.sub(r'^#+\s*', '', line).strip()
+                current_content = []
+            else:
+                current_content.append(line)
+        if current_section:
+            canonical_key = map_advanced_header_to_canonical_key(current_section)
+            sections[canonical_key] = '\n'.join(current_content)
+            found_sections.append(current_section)
+        
+        # Log actual headers found for debugging
+        if found_sections:
+            print(f"  [i] Actual headers found: {found_sections}")
+        
+        # Log which sections were found vs missing
+        missing_sections = [s for s in expected_sections if s not in found_sections]
+        if missing_sections:
+            print(f"  [!] Missing sections: {missing_sections}")
+            # Generate fallback content for missing sections
+            section_mapping = {
+                "1. Customer Personas": "customer_personas",
+                "2. Risk Assessment": "risk",
+                "3. Actionable Recommendations": "recommendations",
+                "4. Financial Benchmarks": "financial",
+                "5. Digital Ads & Paid Media": "digital_ads",
+                "6. UGC & Hashtag Analysis": "ugc",
+                "7. Accessibility & Inclusivity": "accessibility",
+                "8. Seasonal Trends": "seasonal",
+                "9. Next Steps / Action Plan": "action_plan"
+            }
+            for missing in missing_sections:
+                section_key = section_mapping.get(missing)
+                if section_key:
+                    canonical_key = map_advanced_header_to_canonical_key(missing)
+                    # Only generate fallback if not already in sections (prevent duplicates)
+                    if canonical_key not in sections:
+                        fallback_content = generate_fallback_section(section_key, business_category, company, location, domain)
+                        sections[canonical_key] = fallback_content
+                        print(f"  [i] Generated fallback for: {missing}")
+        if found_sections:
+            print(f"  [+] Found sections: {found_sections}")
+        
+        advanced_sections = sections
+        print(f"  Advanced section keys: {sorted(advanced_sections.keys())}")
+        print(f"  Advanced sections parsed: {list(advanced_sections.keys())}")
+
+    # ── Build Final Report ────────────────────────────────────────────────────
+    print("\nBuilding final report...")
+    final_report = synthesize_final_report(
+        company=company,
+        domain=domain,
+        location=location,
+        step_results=step_results,
+        youtube_data=youtube_data if youtube_data else None,
+        advanced_sections=advanced_sections if advanced_sections else None,
+        shared_data=shared_data
+    )
+
+    slug = f"{company}_{domain}_{location}".replace(" ", "_").lower()[:50]
+    path = save_report(final_report, args.output, slug)
+
+    print("\n" + "=" * 80)
+    print(f"  Analysis Complete!")
+    print(f"  Report saved -> {path}")
+    print(f"  Total: {len(final_report):,} chars | {len(final_report.split(chr(10)))} lines")
+    print("=" * 80 + "\n")
+
+
+if __name__ == "__main__":
+    main()
