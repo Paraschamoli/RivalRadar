@@ -92,10 +92,12 @@ The agent supports two LLM providers:
 - Models configured in `agent/config.py`
 
 **Alternative: BharatCode**
+
 - Set `LLM_PROVIDER=bharatcode`
 - Requires `BHARATCODE_API_KEY`
 - Default model: `qwen-3.8-27b`
 - Example configuration:
+
 ```bash
 LLM_PROVIDER=bharatcode
 BHARATCODE_API_KEY=your-bharatcode-api-key
@@ -235,19 +237,22 @@ python main_modular.py --company "Foodhallen" --domain "food hall" --location "A
 ```
 
 #### Cafe with Seed Competitors
+
 ```bash
 python main_modular.py --company "Cafe de Klos" \
                        --domain "cafe" \
                        --location "Amsterdam" \
-                       --initial_competitors "De Bolhoed, The Bulldog, Coffee Ju爷"
+                       --initial_competitors "De Bolhoed, The Bulldog"
 ```
 
 #### Service Business (Gym)
+
 ```bash
 python main_modular.py --company "Fitness First" --domain "gym" --location "Amsterdam"
 ```
 
 #### Custom Output Path
+
 ```bash
 python main_modular.py --company "Restaurant De Kas" \
                        --domain "restaurant" \
@@ -256,6 +261,7 @@ python main_modular.py --company "Restaurant De Kas" \
 ```
 
 #### Skip YouTube API
+
 ```bash
 python main_modular.py --company "Foodhallen" --domain "restaurant" \
                        --location "Amsterdam" --skip-youtube
@@ -295,6 +301,7 @@ To change models, edit these constants and restart.
 To use BharatCode instead of OpenRouter:
 
 1. Add to your `.env` file:
+
 ```bash
 LLM_PROVIDER=bharatcode
 BHARATCODE_API_KEY=your-bharatcode-api-key
@@ -551,5 +558,3 @@ MIT License - see LICENSE file in repository.
 - **Discussions**: GitHub Discussions for questions
 
 ---
-#   R i v a l R a d a r  
- 
