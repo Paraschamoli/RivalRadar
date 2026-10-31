@@ -1,0 +1,76 @@
+RivalRadar — Local Business Market Intelligence
+================================================
+
+What RivalRadar Does
+--------------------
+RivalRadar is an AI-powered competitive intelligence tool for local businesses.
+It helps business owners discover competitors, compare products and pricing,
+analyse local SEO and customer feedback, and identify evidence-based
+opportunities through automated multi-agent research.
+
+Problem It Solves
+-----------------
+Local business owners often lack the time, tools, and expertise to conduct
+thorough competitive research. RivalRadar automates this process using a
+seven-stage pipeline: competitor discovery, product/service analysis,
+pricing analysis, local SEO evaluation, social media monitoring, news
+intelligence, and customer feedback analysis. The result is a structured
+Markdown report with actionable recommendations.
+
+BharatCode Model API Integration
+---------------------------------
+RivalRadar integrates BharatCode as an LLM provider alongside OpenRouter.
+BharatCode provides an OpenAI-compatible chat completions API.
+
+  Endpoint:       https://bharatcode.ai/api/model/v1/chat/completions
+  Authentication: Bearer token via BHARATCODE_API_KEY environment variable
+  Default Model:  qwen-3.8-27b
+  Base URL:       https://bharatcode.ai/api/model/v1
+
+The integration uses Agno's OpenAILike model class, which wraps any
+OpenAI-compatible API. The model factory functions in agent/models.py
+(coordinator_model and agent_model) construct either an OpenRouter or
+OpenAILike instance based on the LLM_PROVIDER environment variable.
+
+How BharatCode Contributes to the Analysis
+-------------------------------------------
+BharatCode's LLM powers every stage of the analysis pipeline:
+- Competitor discovery agents use the LLM to identify and profile competitors
+- Product, pricing, SEO, social media, news, and feedback agents use the LLM
+  to analyse research data and generate structured findings
+- SWOT synthesis and advanced strategic sections use the LLM for higher-level
+  reasoning across all collected data
+- The report generator uses LLM-produced content to assemble the final report
+
+The LLM does not replace external research tools. Tavily, Serper, and
+Firecrawl handle web search and scraping independently. BharatCode (or
+OpenRouter) provides the reasoning layer that processes research results.
+
+Selecting a Provider
+---------------------
+Set the LLM_PROVIDER environment variable:
+
+  For BharatCode:
+    LLM_PROVIDER=bharatcode
+    BHARATCODE_API_KEY=your-api-key
+    BHARATCODE_MODEL=qwen-3.8-27b          (optional, this is the default)
+    BHARATCODE_BASE_URL=https://bharatcode.ai/api/model/v1  (optional)
+
+  For OpenRouter (default):
+    LLM_PROVIDER=openrouter               (or leave unset)
+    OPENROUTER_API_KEY=your-openrouter-key
+
+Switching providers requires only changing environment variables.
+The CLI commands, analysis pipeline, and report format remain the same.
+
+Research Tools Configuration
+-----------------------------
+Research tools are configured independently of the LLM provider:
+  TAVILY_API_KEY    — Tavily web search
+  SERPER_API_KEY    — Serper (Google) search
+  FIRECRAWL_API_KEY — Firecrawl web scraping
+  YOUTUBE_API_KEY   — YouTube Data API (optional)
+
+These keys are required regardless of which LLM provider is selected.
+
+
